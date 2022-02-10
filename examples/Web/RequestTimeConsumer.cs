@@ -20,6 +20,7 @@ using System.Threading.Tasks;
 using Confluent.Kafka;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace Web
 {
@@ -31,34 +32,41 @@ namespace Web
     {
         private readonly string topic;
         private readonly IConsumer<string, long> kafkaConsumer;
+        private readonly ILogger<RequestTimeConsumer> logger;
 
-        public RequestTimeConsumer(IConfiguration config)
+        public RequestTimeConsumer(IConfiguration config, ILogger<RequestTimeConsumer> logger)
         {
+            this.logger = logger;
+
+            // Create consumer from configuration
             var consumerConfig = new ConsumerConfig();
             config.GetSection("Kafka:ConsumerSettings").Bind(consumerConfig);
             this.topic = config.GetValue<string>("Kafka:RequestTimeTopic");
-            this.kafkaConsumer = new ConsumerBuilder<string, long>(consumerConfig).Build();
+            this.kafkaConsumer = new ConsumerBuilder<string, long>(consumerConfig)
+                .SetErrorHandler((consumer, error) =>
+                {
+                    // Log errors through ILogger
+                    if (error.IsError || error.IsFatal) this.logger.LogError($"{error.Code} {error.Reason}");
+                    else logger.LogInformation($"{error.Code} {error.Reason}");
+                })
+                .Build();
         }
 
-        protected override Task ExecuteAsync(CancellationToken stoppingToken)
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            new Thread(() => StartConsumerLoop(stoppingToken)).Start();
+            // Yield to force early asynchronous processing, otherwise we would block other IHostedServices from starting
+            await Task.Yield();
 
-            return Task.CompletedTask;
-        }
-        
-        private void StartConsumerLoop(CancellationToken cancellationToken)
-        {
             kafkaConsumer.Subscribe(this.topic);
 
-            while (!cancellationToken.IsCancellationRequested)
+            while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    var cr = this.kafkaConsumer.Consume(cancellationToken);
+                    var cr = this.kafkaConsumer.Consume(stoppingToken);
 
-                    // Handle message...
-                    Console.WriteLine($"{cr.Message.Key}: {cr.Message.Value}ms");
+                    // Handle message...                    
+                    await SimulateAsyncHandlingOfMessage(cr, stoppingToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -67,7 +75,7 @@ namespace Web
                 catch (ConsumeException e)
                 {
                     // Consumer errors should generally be ignored (or logged) unless fatal.
-                    Console.WriteLine($"Consume error: {e.Error.Reason}");
+                    this.logger.LogError(e, $"Consume error: {e.Error.Reason}");
 
                     if (e.Error.IsFatal)
                     {
@@ -77,18 +85,26 @@ namespace Web
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine($"Unexpected error: {e}");
+                    this.logger.LogError(e, $"Unexpected error: {e}");
                     break;
                 }
             }
         }
-        
+
         public override void Dispose()
         {
             this.kafkaConsumer.Close(); // Commit offsets and leave the group cleanly.
             this.kafkaConsumer.Dispose();
 
             base.Dispose();
+        }
+
+        private async Task SimulateAsyncHandlingOfMessage(ConsumeResult<string, long> consumeResult, CancellationToken cancellationToken)
+        {
+            this.logger.LogInformation("Message received. {Key}: {Value} ms", consumeResult.Message.Key, consumeResult.Message.Value);
+            
+            // Simulate async handling of message
+            await Task.Delay(TimeSpan.FromMilliseconds(50), cancellationToken);
         }
     }
 }
